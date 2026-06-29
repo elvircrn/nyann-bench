@@ -100,6 +100,9 @@ type scenarioOpts struct {
 	// the stage timestamp and current recorder snapshot. The callback can
 	// query Prometheus and print live per-stage results.
 	OnStageComplete func(ts recorder.StageTimestamp, records []recorder.Record)
+
+	OnStageProfileStart func(stage, concurrency int)
+	OnStageProfileStop  func(stage, concurrency int)
 }
 
 // runScenario executes a benchmark scenario and returns the summary.
@@ -387,6 +390,9 @@ func runScenario(ctx context.Context, cancel context.CancelFunc, opts scenarioOp
 			if startTime.IsZero() {
 				startTime = now
 			} else if !lastStageStart.IsZero() {
+				if opts.OnStageProfileStop != nil {
+					opts.OnStageProfileStop(measuredStageIdx-1, lastConcurrency)
+				}
 				ts := recorder.StageTimestamp{
 					Stage:       measuredStageIdx - 1,
 					Concurrency: lastConcurrency,
@@ -402,6 +408,10 @@ func runScenario(ctx context.Context, cancel context.CancelFunc, opts scenarioOp
 			lastStageStart = now
 			lastConcurrency = concurrency
 			measuredStageIdx++
+
+			if opts.OnStageProfileStart != nil {
+				opts.OnStageProfileStart(measuredStageIdx-1, concurrency)
+			}
 
 			if opts.OnStageComplete == nil {
 				if stageName != "" {
@@ -473,6 +483,12 @@ func runScenario(ctx context.Context, cancel context.CancelFunc, opts scenarioOp
 
 	rec.Close()
 	records := rec.Records()
+
+	// Stop profiling for the final stage.
+	if opts.OnStageProfileStop != nil && len(stageTimestamps) > 0 {
+		last := stageTimestamps[len(stageTimestamps)-1]
+		opts.OnStageProfileStop(last.Stage, last.Concurrency)
+	}
 
 	// Report the final stage now that all records are flushed.
 	if opts.OnStageComplete != nil && len(stageTimestamps) > 0 {

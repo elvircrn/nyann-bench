@@ -2,13 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,6 +36,7 @@ func generateCmd() *cobra.Command {
 		metricsAddr   string
 		prometheusURL string
 		deployName    string
+		profileRole   string
 		kubeFlags     kube.Flags
 	)
 
@@ -157,7 +162,7 @@ Workload types:
 			headerPrinted := false
 			var collected []*analysis.ServerMetrics
 
-			summary, err := runScenario(ctx, cancel, scenarioOpts{
+			opts := scenarioOpts{
 				Target:      target,
 				Model:       model,
 				Scenario:    sc,
@@ -185,7 +190,40 @@ Workload types:
 					}
 					fmt.Fprint(os.Stderr, analysis.FormatStageRow(stage))
 				},
-			})
+			}
+
+			if profileRole != "" {
+				if deployName == "" {
+					return fmt.Errorf("--profile requires --deploy-name")
+				}
+				if profileRole != "decode" && profileRole != "prefill" {
+					return fmt.Errorf("--profile must be 'decode' or 'prefill'")
+				}
+				podPrefix := deployName
+				port := 8200
+				if profileRole == "prefill" {
+					podPrefix = strings.Replace(deployName, "-decode", "-prefill", 1)
+					port = 8000
+				}
+				profileURLs, err := discoverPodURLs(podPrefix, port)
+				if err != nil {
+					return fmt.Errorf("discovering %s pods: %w", profileRole, err)
+				}
+				if len(profileURLs) == 0 {
+					return fmt.Errorf("no running %s pods found matching %s", profileRole, podPrefix)
+				}
+				slog.Info("Per-stage profiling enabled", "role", profileRole, "targets", profileURLs)
+				opts.OnStageProfileStart = func(stage, concurrency int) {
+					slog.Info("Starting profile", "stage", stage, "concurrency", concurrency)
+					postProfileAction(profileURLs, "/start_profile")
+				}
+				opts.OnStageProfileStop = func(stage, concurrency int) {
+					slog.Info("Stopping profile", "stage", stage, "concurrency", concurrency)
+					postProfileAction(profileURLs, "/stop_profile")
+				}
+			}
+
+			summary, err := runScenario(ctx, cancel, opts)
 			if err != nil {
 				return err
 			}
@@ -231,8 +269,97 @@ Workload types:
 	cmd.Flags().StringVar(&metricsAddr, "metrics", "", "Prometheus metrics listen address (e.g. :9090)")
 	cmd.Flags().StringVar(&prometheusURL, "prometheus-url", "", "Prometheus server URL for querying server-side vLLM metrics (e.g. http://prometheus:9090)")
 	cmd.Flags().StringVar(&deployName, "deploy-name", "", "Deployment name prefix for Prometheus pod label filtering (e.g. my-deploy)")
+	cmd.Flags().StringVar(&profileRole, "profile", "", "Enable per-stage torch profiling on vLLM pods (decode or prefill). Requires --deploy-name.")
 
 	kube.RegisterFlags(cmd, &kubeFlags)
 
 	return cmd
+}
+
+func postProfileAction(urls []string, path string) {
+	var wg sync.WaitGroup
+	for _, u := range urls {
+		wg.Add(1)
+		go func(baseURL string) {
+			defer wg.Done()
+			url := strings.TrimRight(baseURL, "/") + path
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			req, err := http.NewRequestWithContext(ctx, "POST", url, nil)
+			if err != nil {
+				slog.Warn("Profile request failed", "url", url, "error", err)
+				return
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				slog.Warn("Profile request failed", "url", url, "error", err)
+				return
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				slog.Warn("Profile request non-200", "url", url, "status", resp.StatusCode)
+			}
+		}(u)
+	}
+	wg.Wait()
+}
+
+func discoverPodURLs(podPrefix string, port int) ([]string, error) {
+	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return nil, fmt.Errorf("reading service account token: %w (not running in-cluster?)", err)
+	}
+	ns, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+	if err != nil {
+		return nil, fmt.Errorf("reading namespace: %w", err)
+	}
+
+	apiURL := fmt.Sprintf("https://kubernetes.default.svc/api/v1/namespaces/%s/pods?fieldSelector=status.phase=Running", string(ns))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+string(token))
+
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfigSkipVerify()}}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("querying K8s API: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("K8s API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var podList struct {
+		Items []struct {
+			Status struct {
+				PodIP string `json:"podIP"`
+				Phase string `json:"phase"`
+			} `json:"status"`
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&podList); err != nil {
+		return nil, fmt.Errorf("decoding pod list: %w", err)
+	}
+
+	var urls []string
+	for _, pod := range podList.Items {
+		if strings.HasPrefix(pod.Metadata.Name, podPrefix) && pod.Status.PodIP != "" {
+			urls = append(urls, fmt.Sprintf("http://%s:%d", pod.Status.PodIP, port))
+		}
+	}
+	return urls, nil
+}
+
+func tlsConfigSkipVerify() *tls.Config {
+	return &tls.Config{InsecureSkipVerify: true} //nolint:gosec // in-cluster K8s API
 }
