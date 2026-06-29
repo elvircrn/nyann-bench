@@ -109,6 +109,13 @@ func (r *Recorder) Records() []Record {
 	return r.records
 }
 
+// RecordCount returns the number of records written so far.
+func (r *Recorder) RecordCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.records)
+}
+
 // Close drains pending writes and closes the underlying file.
 // Safe to call multiple times.
 func (r *Recorder) Close() error {

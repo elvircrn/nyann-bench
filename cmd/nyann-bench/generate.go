@@ -37,6 +37,7 @@ func generateCmd() *cobra.Command {
 		prometheusURL string
 		deployName    string
 		profileRole   string
+		profileAfter  int
 		kubeFlags     kube.Flags
 	)
 
@@ -212,12 +213,27 @@ Workload types:
 				if len(profileURLs) == 0 {
 					return fmt.Errorf("no running %s pods found matching %s", profileRole, podPrefix)
 				}
-				slog.Info("Per-stage profiling enabled", "role", profileRole, "targets", profileURLs)
-				opts.OnStageProfileStart = func(stage, concurrency int) {
-					slog.Info("Starting profile", "stage", stage, "concurrency", concurrency)
-					postProfileAction(profileURLs, "/start_profile")
+				slog.Info("Per-stage profiling enabled", "role", profileRole, "targets", profileURLs, "after", profileAfter)
+				waitThreshold := profileAfter
+				var profileStarted sync.WaitGroup
+				opts.OnStageProfileStart = func(stage, concurrency int, recordCount func() int) {
+					profileStarted.Add(1)
+					go func() {
+						defer profileStarted.Done()
+						if waitThreshold > 0 {
+							baseline := recordCount()
+							target := baseline + waitThreshold
+							slog.Info("Waiting for requests before profiling", "stage", stage, "need", waitThreshold)
+							for recordCount() < target {
+								time.Sleep(100 * time.Millisecond)
+							}
+						}
+						slog.Info("Starting profile", "stage", stage, "concurrency", concurrency)
+						postProfileAction(profileURLs, "/start_profile")
+					}()
 				}
 				opts.OnStageProfileStop = func(stage, concurrency int) {
+					profileStarted.Wait()
 					slog.Info("Stopping profile", "stage", stage, "concurrency", concurrency)
 					postProfileAction(profileURLs, "/stop_profile")
 				}
@@ -270,6 +286,7 @@ Workload types:
 	cmd.Flags().StringVar(&prometheusURL, "prometheus-url", "", "Prometheus server URL for querying server-side vLLM metrics (e.g. http://prometheus:9090)")
 	cmd.Flags().StringVar(&deployName, "deploy-name", "", "Deployment name prefix for Prometheus pod label filtering (e.g. my-deploy)")
 	cmd.Flags().StringVar(&profileRole, "profile", "", "Enable per-stage torch profiling on vLLM pods (decode or prefill). Requires --deploy-name.")
+	cmd.Flags().IntVar(&profileAfter, "profile-after", 0, "Wait for at least N completed requests in the stage before starting the profile")
 
 	kube.RegisterFlags(cmd, &kubeFlags)
 

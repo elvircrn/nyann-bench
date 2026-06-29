@@ -101,7 +101,7 @@ type scenarioOpts struct {
 	// query Prometheus and print live per-stage results.
 	OnStageComplete func(ts recorder.StageTimestamp, records []recorder.Record)
 
-	OnStageProfileStart func(stage, concurrency int)
+	OnStageProfileStart func(stage, concurrency int, recordCount func() int)
 	OnStageProfileStop  func(stage, concurrency int)
 }
 
@@ -410,7 +410,7 @@ func runScenario(ctx context.Context, cancel context.CancelFunc, opts scenarioOp
 			measuredStageIdx++
 
 			if opts.OnStageProfileStart != nil {
-				opts.OnStageProfileStart(measuredStageIdx-1, concurrency)
+				opts.OnStageProfileStart(measuredStageIdx-1, concurrency, rec.RecordCount)
 			}
 
 			if opts.OnStageComplete == nil {
